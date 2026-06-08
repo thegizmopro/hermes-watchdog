@@ -1,1 +1,123 @@
-# ===========================================================================#  Hermes Infrastructure Setup for thinkzo#  Creates: Hermes_Gateway, Hermes_Watchdog, Hermes_Tray scheduled tasks#  Based on lappy's setup -- S4U logon, AtStartup triggers, PT30S gateway delay# ===========================================================================$UserName = "kenzo"$HermesHome = "C:\Users\kenzo\AppData\Local\hermes"$PythonExe = "$HermesHome\hermes-agent\venv\Scripts\pythonw.exe"$GatewayCmd = "$HermesHome\gateway-service\Hermes_Gateway.cmd"$WatchdogScript = "$HermesHome\scripts\gateway_watchdog.py"$TrayScript = "$HermesHome\scripts\hermes-tray.ps1"Write-Output "=== Hermes Infrastructure Setup ==="Write-Output "HermesHome: $HermesHome"Write-Output ""# --- Clean up any existing tasks ---foreach ($taskName in @("Hermes_Gateway", "Hermes_Watchdog", "Hermes_Tray")) {    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue    if ($existing) {        Write-Output "Removing existing task: $taskName"        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false    }}# --- Create Hermes_Gateway task ---Write-Output "Creating Hermes_Gateway task..."$gatewayAction = New-ScheduledTaskAction -Execute $GatewayCmd$gatewayTrigger = New-ScheduledTaskTrigger -AtStartup# Add 30s delay to the trigger (let Tailscale/network initialize)$gatewayTrigger.StartBoundary = ""  # Clear for AtStartup$gatewayTrigger.Delay = "PT30S"$gatewaySettings = New-ScheduledTaskSettingsSet `    -AllowStartIfOnBatteries `    -DontStopIfGoingOnBatteries `    -StartWhenAvailable `    -RestartCount 3 `    -RestartInterval (New-TimeSpan -Minutes 1)$gatewayPrincipal = New-ScheduledTaskPrincipal `    -UserId $UserName `    -LogonType S4U `    -RunLevel HighestRegister-ScheduledTask -TaskName "Hermes_Gateway" `    -Action $gatewayAction `    -Trigger $gatewayTrigger `    -Settings $gatewaySettings `    -Principal $gatewayPrincipal `    -Description "Hermes Agent Gateway -- auto-starts at boot (30s delay for network init)"Write-Output "  Done."# --- Create Hermes_Watchdog task ---Write-Output "Creating Hermes_Watchdog task..."$watchdogAction = New-ScheduledTaskAction `    -Execute $PythonExe `    -Argument $WatchdogScript$watchdogTrigger = New-ScheduledTaskTrigger -AtStartup$watchdogSettings = New-ScheduledTaskSettingsSet `    -AllowStartIfOnBatteries `    -DontStopIfGoingOnBatteries `    -StartWhenAvailable `    -RestartCount 999 `    -RestartInterval (New-TimeSpan -Minutes 1)$watchdogPrincipal = New-ScheduledTaskPrincipal `    -UserId $UserName `    -LogonType S4U `    -RunLevel HighestRegister-ScheduledTask -TaskName "Hermes_Watchdog" `    -Action $watchdogAction `    -Trigger $watchdogTrigger `    -Settings $watchdogSettings `    -Principal $watchdogPrincipal `    -Description "Hermes Gateway Watchdog -- monitors and restarts gateway if down"Write-Output "  Done."# --- Create Hermes_Tray task ---Write-Output "Creating Hermes_Tray task..."$trayAction = New-ScheduledTaskAction `    -Execute "powershell.exe" `    -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$TrayScript`""# Dual trigger: AtLogOn (primary) + AtStartup with 60s delay (fallback after unattended reboot)$trayTriggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $UserName$trayTriggerStartup = New-ScheduledTaskTrigger -AtStartup$trayTriggerStartup.Delay = "PT60S"$traySettings = New-ScheduledTaskSettingsSet `    -AllowStartIfOnBatteries `    -DontStopIfGoingOnBatteries `    -StartWhenAvailable `    -MultipleInstances IgnoreNew$trayPrincipal = New-ScheduledTaskPrincipal `    -UserId $UserName `    -LogonType Interactive `    -RunLevel HighestRegister-ScheduledTask -TaskName "Hermes_Tray" `    -Action $trayAction `    -Trigger @($trayTriggerLogon, $trayTriggerStartup) `    -Settings $traySettings `    -Principal $trayPrincipal `    -Description "Hermes Gateway Tray Icon -- shows gateway status in system tray"Write-Output "  Done."Write-Output ""Write-Output "=== Setup Complete ==="Write-Output ""Write-Output "Tasks created:"Get-ScheduledTask -TaskName "Hermes_*" | Format-Table TaskName, State -AutoSize
+# ===========================================================================
+#  Hermes Infrastructure Setup for thinkzo
+#  Creates: Hermes_Gateway, Hermes_Watchdog, Hermes_Tray scheduled tasks
+#  Based on lappy's setup -- S4U logon, AtStartup triggers, PT30S gateway delay
+# ===========================================================================
+
+$UserName = "kenzo"
+$HermesHome = "C:\Users\kenzo\AppData\Local\hermes"
+$PythonExe = "$HermesHome\hermes-agent\venv\Scripts\pythonw.exe"
+$GatewayCmd = "$HermesHome\gateway-service\Hermes_Gateway.cmd"
+$WatchdogScript = "$HermesHome\scripts\gateway_watchdog.py"
+$TrayScript = "$HermesHome\scripts\hermes-tray.ps1"
+
+Write-Output "=== Hermes Infrastructure Setup ==="
+Write-Output "HermesHome: $HermesHome"
+Write-Output ""
+
+# --- Clean up any existing tasks ---
+foreach ($taskName in @("Hermes_Gateway", "Hermes_Watchdog", "Hermes_Tray")) {
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Output "Removing existing task: $taskName"
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    }
+}
+
+# --- Create Hermes_Gateway task ---
+Write-Output "Creating Hermes_Gateway task..."
+
+$gatewayAction = New-ScheduledTaskAction -Execute $GatewayCmd
+$gatewayTrigger = New-ScheduledTaskTrigger -AtStartup
+# Add 30s delay to the trigger (let Tailscale/network initialize)
+$gatewayTrigger.StartBoundary = ""  # Clear for AtStartup
+$gatewayTrigger.Delay = "PT30S"
+
+$gatewaySettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
+
+$gatewayPrincipal = New-ScheduledTaskPrincipal `
+    -UserId $UserName `
+    -LogonType S4U `
+    -RunLevel Highest
+
+Register-ScheduledTask -TaskName "Hermes_Gateway" `
+    -Action $gatewayAction `
+    -Trigger $gatewayTrigger `
+    -Settings $gatewaySettings `
+    -Principal $gatewayPrincipal `
+    -Description "Hermes Agent Gateway -- auto-starts at boot (30s delay for network init)"
+
+Write-Output "  Done."
+
+# --- Create Hermes_Watchdog task ---
+Write-Output "Creating Hermes_Watchdog task..."
+
+$watchdogAction = New-ScheduledTaskAction `
+    -Execute $PythonExe `
+    -Argument $WatchdogScript
+
+$watchdogTrigger = New-ScheduledTaskTrigger -AtStartup
+
+$watchdogSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 999 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
+
+$watchdogPrincipal = New-ScheduledTaskPrincipal `
+    -UserId $UserName `
+    -LogonType S4U `
+    -RunLevel Highest
+
+Register-ScheduledTask -TaskName "Hermes_Watchdog" `
+    -Action $watchdogAction `
+    -Trigger $watchdogTrigger `
+    -Settings $watchdogSettings `
+    -Principal $watchdogPrincipal `
+    -Description "Hermes Gateway Watchdog -- monitors and restarts gateway if down"
+
+Write-Output "  Done."
+
+# --- Create Hermes_Tray task ---
+Write-Output "Creating Hermes_Tray task..."
+
+$trayAction = New-ScheduledTaskAction `
+    -Execute "powershell.exe" `
+    -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$TrayScript`""
+
+# Dual trigger: AtLogOn (primary) + AtStartup with 60s delay (fallback after unattended reboot)
+$trayTriggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $UserName
+$trayTriggerStartup = New-ScheduledTaskTrigger -AtStartup
+$trayTriggerStartup.Delay = "PT60S"
+
+$traySettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -MultipleInstances IgnoreNew
+
+$trayPrincipal = New-ScheduledTaskPrincipal `
+    -UserId $UserName `
+    -LogonType Interactive `
+    -RunLevel Highest
+
+Register-ScheduledTask -TaskName "Hermes_Tray" `
+    -Action $trayAction `
+    -Trigger @($trayTriggerLogon, $trayTriggerStartup) `
+    -Settings $traySettings `
+    -Principal $trayPrincipal `
+    -Description "Hermes Gateway Tray Icon -- shows gateway status in system tray"
+
+Write-Output "  Done."
+
+Write-Output ""
+Write-Output "=== Setup Complete ==="
+Write-Output ""
+Write-Output "Tasks created:"
+Get-ScheduledTask -TaskName "Hermes_*" | Format-Table TaskName, State -AutoSize
