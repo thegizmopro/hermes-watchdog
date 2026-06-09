@@ -258,8 +258,32 @@ if (-not $hadExistingKey) {
     Write-Host "  ed25519 key exists: OK (skipping generation to avoid overwrite prompt)"
 }
 
-# Read the public key
-$pubKeyContent = Get-Content "$ed25519Key.pub" -Raw
+# Read the public key (fix permissions first if existing key is unreadable)
+try {
+    $pubKeyContent = Get-Content "$ed25519Key.pub" -Raw -ErrorAction Stop
+} catch {
+    Write-Host "  Existing key has restrictive permissions. Fixing..."
+    icacls $ed25519Key /inheritance:r 2>&1 | Out-Null
+    icacls "$ed25519Key.pub" /inheritance:r 2>&1 | Out-Null
+    icacls $ed25519Key /grant "${env:USERNAME}:(F)" 2>&1 | Out-Null
+    icacls "$ed25519Key.pub" /grant "${env:USERNAME}:(F)" 2>&1 | Out-Null
+    try {
+        $pubKeyContent = Get-Content "$ed25519Key.pub" -Raw -ErrorAction Stop
+        Write-Host "  Key permissions fixed: OK"
+    } catch {
+        Write-Host "  ERROR: Cannot read key file even after permission fix."
+        Write-Host "  Removing old key and regenerating..."
+        Remove-Item $ed25519Key -Force -ErrorAction SilentlyContinue
+        Remove-Item "$ed25519Key.pub" -Force -ErrorAction SilentlyContinue
+        $hostname = hostname
+        $null = ssh-keygen -t ed25519 -f $ed25519Key -N '""' -C "$env:USERNAME@$hostname" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "ssh-keygen failed after permission fix"
+        }
+        $pubKeyContent = Get-Content "$ed25519Key.pub" -Raw
+        Write-Host "  Key regenerated: OK"
+    }
+}
 Write-Host ""
 Write-Host "  === YOUR PUBLIC KEY (send to fleet operators) ==="
 Write-Host "  $($pubKeyContent.Trim())"
