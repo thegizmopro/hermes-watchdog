@@ -360,14 +360,7 @@ Write-Host "  Setting ACLs on administrators_authorized_keys..."
 
 $aclOk = $true
 
-# Take ownership
-takeown /f $adminAK /a 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "  WARNING: takeown failed."
-    $aclOk = $false
-}
-
-# Remove all inheritance
+# Remove all inheritance (we own the file since we just created it)
 icacls $adminAK /inheritance:r 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  WARNING: icacls /inheritance:r failed."
