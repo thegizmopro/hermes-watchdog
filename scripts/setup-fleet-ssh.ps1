@@ -214,7 +214,6 @@ if ($profiles -match "Private.*ON") {
 } else {
     Write-Host "  NOTE: Firewall Private profile may be off. Check: netsh advfirewall show currentprofile"
 }
-}
 
 # ---------------------------------------------------------------------------
 # 5. SSH key management
