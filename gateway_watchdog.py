@@ -335,17 +335,19 @@ def main():
                     tick_stale_since = None
 
             # --- Check 3: Log freshness backstop (4h, catches pathological cases) ---
-            if not in_grace:
+            # Only fires if the tick heartbeat is ALSO stale — a quiet log with a live
+            # heartbeat just means nobody's talking to the gateway (normal idle).
+            if not in_grace and tick_stale_since is not None:
                 log_age = get_file_age(GATEWAY_LOG)
                 if log_age is not None and log_age > LOG_STALE_THRESHOLD:
                     if log_stale_since is None:
                         log_stale_since = time.time()
-                        log(f"Gateway log stale ({log_age:.0f}s since last write) - "
-                            f"backstop trigger")
+                        log(f"Gateway log stale ({log_age:.0f}s since last write) AND "
+                            f"tick stale - backstop trigger")
                     else:
                         stale_duration = time.time() - log_stale_since
                         if stale_duration >= 60 and can_restart():
-                            do_restart(f"log stale for {log_age:.0f}s "
+                            do_restart(f"log stale for {log_age:.0f}s AND tick stale "
                                        f"(detected {stale_duration:.0f}s ago) [backstop]")
                             time.sleep(CHECK_INTERVAL)
                             continue
