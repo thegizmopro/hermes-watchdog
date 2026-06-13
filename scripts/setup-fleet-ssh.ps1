@@ -199,8 +199,10 @@ if ($hasPort22) {
 } else {
     Write-Host "  No port 22 rule found. Creating..."
     try {
-        netsh advfirewall firewall add rule name="sshd" dir=in action=allow protocol=TCP localport=22 2>&1 | Out-Null
-        Write-Host "  Firewall rule created: OK"
+        # Scope to Private profile only -- Public profile open on a laptop at a coffee shop = bad time.
+        # Fleet machines should be on Tailscale (Private/Domain), not accepting SSH from public WiFi.
+        netsh advfirewall firewall add rule name="sshd" dir=in action=allow protocol=TCP localport=22 profile=private 2>&1 | Out-Null
+        Write-Host "  Firewall rule created (Private profile only): OK"
     } catch {
         Write-Host "  WARNING: Could not create firewall rule: $_"
         Write-Host "  SSH may be blocked by Windows Firewall."
@@ -246,9 +248,10 @@ $hadExistingKey = Test-Path $ed25519Key
 if (-not $hadExistingKey) {
     Write-Host "  No ed25519 key found. Generating..."
     $hostname = hostname
-    # NOTE: -N '""' passes an empty string as the passphrase.
-    # In PowerShell, '""' is two double-quote chars; ssh-keygen interprets this as empty.
-    $null = ssh-keygen -t ed25519 -f $ed25519Key -N '""' -C "$env:USERNAME@$hostname" 2>&1
+    # NOTE: -N """""" (6 double-quotes) is the safest empty-passphrase pattern across PS5/7.
+    # -N '""' (single-wrapped) is fragile and breaks on some PS versions.
+    # 6 quotes: outer pair delimits string, inner pairs are escaped quotes -> empty string.
+    $null = ssh-keygen -t ed25519 -f $ed25519Key -N """""" -C "$env:USERNAME@$hostname" 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  ERROR: ssh-keygen failed with exit code $LASTEXITCODE"
         throw "ssh-keygen failed"
@@ -276,7 +279,7 @@ try {
         Remove-Item $ed25519Key -Force -ErrorAction SilentlyContinue
         Remove-Item "$ed25519Key.pub" -Force -ErrorAction SilentlyContinue
         $hostname = hostname
-        $null = ssh-keygen -t ed25519 -f $ed25519Key -N '""' -C "$env:USERNAME@$hostname" 2>&1
+        $null = ssh-keygen -t ed25519 -f $ed25519Key -N """""" -C "$env:USERNAME@$hostname" 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "ssh-keygen failed after permission fix"
         }
@@ -439,6 +442,35 @@ if (Test-Path $sshdConfig) {
         Write-Host "  WARNING: PubkeyAuthentication may not be explicitly enabled."
         Write-Host "  Default is 'yes', but if key auth fails, check sshd_config."
     }
+
+    # Harden sshd_config: enforce key-only auth (ARES recommendation)
+    $hardened = $false
+    $configLines = $configContent -split "`n"
+    $needsPasswordAuth = -not ($configLines | Where-Object { $_ -match '^\s*PasswordAuthentication\s+no\b' -and $_ -notmatch '^\s*#' })
+    $needsPubkeyAuth = -not ($configLines | Where-Object { $_ -match '^\s*PubkeyAuthentication\s+yes\b' -and $_ -notmatch '^\s*#' })
+
+    if ($needsPasswordAuth -or $needsPubkeyAuth) {
+        Write-Host "  Appending hardening directives to sshd_config..."
+        $appendLines = @("")
+        if ($needsPasswordAuth) {
+            $appendLines += "PasswordAuthentication no"
+            Write-Host "    + PasswordAuthentication no"
+        }
+        if ($needsPubkeyAuth) {
+            $appendLines += "PubkeyAuthentication yes"
+            Write-Host "    + PubkeyAuthentication yes"
+        }
+        $appendLines += ""
+        Add-Content -Path $sshdConfig -Value ($appendLines -join "`n")
+        $hardened = $true
+    }
+
+    if ($hardened) {
+        Write-Host "  sshd_config hardened: password auth disabled, key auth enforced."
+        Write-Host "  (Changes take effect after sshd restart in step 9.)"
+    } else {
+        Write-Host "  sshd_config already hardened (key-only auth): OK"
+    }
 } else {
     Write-Host "  WARNING: sshd_config not found at $sshdConfig"
 }
@@ -449,10 +481,11 @@ if (Test-Path $sshdConfig) {
 Write-Host "[8/9] Testing local SSH..."
 
 # First connection to localhost triggers a host-key prompt. Use accept-new to handle it.
-$localTestCmd = "ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=`"$sshDir\\known_hosts`" $env:USERNAME@localhost `"hostname; whoami`""
-Write-Host "  Attempting: $localTestCmd"
+# Direct ssh call -- no Invoke-Expression needed since inputs are all controlled variables.
+# (TARS flagged IEX as a potential injection vector if FleetKey ever takes external input.)
+Write-Host "  Attempting: ssh $env:USERNAME@localhost (key-based)"
 try {
-    $localTest = Invoke-Expression $localTestCmd 2>&1
+    $localTest = ssh -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$sshDir\known_hosts" $env:USERNAME@localhost "hostname; whoami" 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  Local SSH test: PASSED"
         Write-Host "  Output: $localTest"
@@ -528,7 +561,22 @@ $routableIPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinu
 if ($routableIPs) {
     Write-Host "IP(s):     $($routableIPs -join ', ')"
 }
-Write-Host "SSH Port:  22"
+
+# Tailscale IP detection (ARES recommendation -- fleet operators need the mesh address)
+$tsExe = Get-Command tailscale -ErrorAction SilentlyContinue
+if ($tsExe) {
+    try {
+        $tsIP = (tailscale ip -4 2>&1 | Select-Object -First 1).Trim()
+        if ($tsIP -and $tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
+            Write-Host "Tailscale: $tsIP (USE THIS for fleet SSH)"
+        }
+    } catch {
+        Write-Host "Tailscale: installed but could not get IP"
+    }
+} else {
+    Write-Host "Tailscale: not installed (install for mesh networking)"
+}
+Write-Host "SSH Port:  22 (Private profile only)"
 Write-Host "sshd:      $((Get-Service sshd -ErrorAction SilentlyContinue).Status)"
 Write-Host ""
 Write-Host "=== FLEET OPERATORS CAN NOW CONNECT ==="
