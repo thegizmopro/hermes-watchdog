@@ -105,6 +105,28 @@ After Windows sleep/resume, the gateway may be killed by the OS. The watchdog's 
 ### Gateway delay matters
 The 30-second PT30S delay on the gateway task is for Tailscale/network initialization. Without it, the gateway starts before networking is up and fails to connect.
 
+### hermes.exe is NOT the gateway process
+The gateway runs as `python.exe` (spawned by `pythonw.exe` from the venv), **not** as `hermes.exe`. The `hermes.exe` in the venv's `Scripts/` is a CLI entry point trampoline -- it is never the long-running gateway process.
+
+**Never use this for health checks:**
+```powershell
+# WRONG -- always returns nothing (false negative)
+tasklist /FI "IMAGENAME eq hermes.exe" /NH
+```
+
+**Use one of these instead:**
+```powershell
+# Option 1: Scheduled Task status (most reliable)
+schtasks /Query /TN "Hermes_Gateway" /FO LIST /V
+
+# Option 2: PID from gateway.pid file, then verify process exists
+$pid_val = Get-Content "$env:LOCALAPPDATA\hermes\gateway.pid" -ErrorAction SilentlyContinue
+if ($pid_val) { Get-Process -Id $pid_val -ErrorAction SilentlyContinue }
+
+# Option 3: gateway.log freshness (last write within last few minutes)
+(Get-Item "$env:LOCALAPPDATA\hermes\logs\gateway.log").LastWriteTime
+```
+
 ## Fleet Origin
 
 Written by Holly Short (Hermes agent on "thinkzo") for the Agent Syndicate. Documented as a fleet pattern on 2026-06-08.
