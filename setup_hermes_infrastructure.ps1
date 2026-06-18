@@ -37,6 +37,7 @@ $gatewaySettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan) `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1)
 
@@ -67,6 +68,7 @@ $watchdogSettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan) `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1)
 
@@ -100,6 +102,7 @@ $traySettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan) `
     -MultipleInstances IgnoreNew
 
 $trayPrincipal = New-ScheduledTaskPrincipal `
