@@ -63,12 +63,17 @@ $watchdogAction = New-ScheduledTaskAction `
     -Argument $WatchdogScript
 
 $watchdogTrigger = New-ScheduledTaskTrigger -AtStartup
+# Repetition interval: relaunch every 5 min. If already running, IgnoreNew skips.
+# Without this, if the watchdog process dies silently the task never re-fires.
+$watchdogTrigger.StartBoundary = ""
+$watchdogTrigger.Repetition = (New-CimInstance -CimClass (Get-CimClass MSFT_TaskRepetitionPattern Root/Microsoft/Windows/TaskScheduler) -Property @{ Interval='PT5M'; Duration='' } -ClientOnly)
 
 $watchdogSettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -ExecutionTimeLimit (New-TimeSpan) `
+    -MultipleInstances IgnoreNew `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1)
 

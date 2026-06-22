@@ -99,6 +99,13 @@ Running the setup script as SYSTEM gets access denied when creating S4U tasks. M
 ### pythonw.exe parent-child
 Hermes venv launches `pythonw.exe` which spawns `python.exe`. WMIC sees two processes — normal. The PID-file check avoids false positives.
 
+### Watchdog self-healing (PT5M repetition)
+The watchdog runs as a long-running daemon via `pythonw.exe`. If the process dies silently (OS kill, clean exit, crash), the original `BootTrigger` never re-fired — the watchdog stayed dead until the next reboot, leaving the gateway unprotected for hours or days.
+
+**Fix (2026-06-22):** The BootTrigger now has a **5-minute repetition interval** (`PT5M`). Task Scheduler attempts to launch every 5 minutes; if the process is still running, `IgnoreNew` skips it. If it's dead, it relaunches automatically.
+
+**Applying to existing deployments:** Run `scripts/fix-watchdog-repetition.ps1` — it patches the trigger in-place without recreating the task.
+
 ### Sleep/wake
 After Windows sleep/resume, the gateway may be killed by the OS. The watchdog's grace period prevents false stale alerts, and the AtStartup trigger handles full reboots.
 
