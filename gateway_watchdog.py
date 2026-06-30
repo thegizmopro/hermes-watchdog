@@ -1,13 +1,22 @@
 """
-Hermes Gateway Watchdog for Windows (v2.2)
+Hermes Gateway Watchdog for Windows (v2.4)
 Runs persistently, monitors gateway, restarts if down or frozen.
 Designed to be started via Scheduled Task (AtStartup trigger).
+
+v2.4 changes (2026-06-30):
+  - Merged best of Holly v2.3 + Mini v2.3 into unified fleet version
+  - Added single-instance guard via PID lock file (watchdog.lock) [Holly]
+    On startup, checks if another watchdog instance is alive; if so, exits silently.
+    Fixes zombie stacking: Task Scheduler launching new instances while old ones
+    were still alive but wedged, causing multiple zombie watchdog pairs.
+  - Removed log freshness backstop entirely (was 4h threshold) [Mini]
+    Cron tick lock heartbeat is now the sole zombie detection mechanism.
+    The 4h log backstop caused false restarts during long idle periods.
 
 v2.2 changes (2026-06-08):
   - Replaced log staleness with cron tick lock heartbeat as primary zombie check
   - cron/.tick.lock is touched every 60s by the gateway's event loop ticker
   - This eliminates false positives when the gateway is healthy but idle (no messages)
-  - Old log staleness kept as a secondary backstop at very high threshold (4h)
   - Fixed post-restart grace period (applies after ANY restart, not just watchdog start)
 
 v2.1 changes (2026-06-07):
@@ -18,12 +27,14 @@ v2.1 changes (2026-06-07):
   - start_gateway() uses `schtasks /Run` (single process chain, no duplicates)
   - Explicit HERMES_HOME env var in all subprocess calls
 
-Three-tier health check:
+Two-tier health check:
   1. PID file check — is the process from gateway.pid alive?
   2. Cron tick lock heartbeat — has cron/.tick.lock been touched recently?
      (Catches "zombie" state: process alive but event loop dead.)
-  3. Log freshness backstop — has gateway.log been written to in 4 hours?
-     (Last-resort catch for pathological edge cases.)
+
+Single-instance guard:
+  Uses watchdog.lock to ensure only one watchdog process runs at a time.
+  If Task Scheduler launches a new instance while one is alive, the new one exits.
 """
 
 import subprocess
@@ -41,10 +52,6 @@ DOWN_THRESHOLD = 30        # seconds of process missing before restarting
 # If it hasn't been touched in 5 minutes (5 missed ticks), the event loop is dead.
 TICK_STALE_THRESHOLD = 300  # 5 minutes
 
-# Secondary backstop: log freshness (only fires after 4 hours of silence)
-# This catches pathological cases where the ticker somehow runs but nothing else works.
-LOG_STALE_THRESHOLD = 14400  # 4 hours
-
 RESTART_COOLDOWN = 60      # minimum seconds between restarts
 MAX_RESTARTS_PER_HOUR = 5  # circuit breaker
 STARTUP_GRACE = 120        # seconds after restart before heartbeat checks (handles startup + sleep/wake)
@@ -52,9 +59,9 @@ STARTUP_GRACE = 120        # seconds after restart before heartbeat checks (hand
 HERMES_HOME = r"C:\Users\kenzo\AppData\Local\hermes"
 HERMES_EXE = r"C:\Users\kenzo\AppData\Local\hermes\hermes-agent\venv\Scripts\hermes.exe"
 GATEWAY_PID_FILE = os.path.join(HERMES_HOME, "gateway.pid")
-GATEWAY_LOG = os.path.join(HERMES_HOME, "logs", "gateway.log")
 CRON_TICK_LOCK = os.path.join(HERMES_HOME, "cron", ".tick.lock")
 WATCHDOG_LOG = os.path.join(HERMES_HOME, "logs", "watchdog.log")
+WATCHDOG_LOCK = os.path.join(HERMES_HOME, "watchdog.lock")
 GATEWAY_TASK = "Hermes_Gateway"
 
 # State files that can go stale and cause issues
@@ -66,7 +73,6 @@ GATEWAY_EXCLUDES = ["gateway_watchdog", "wmic"]
 
 down_since = None
 tick_stale_since = None
-log_stale_since = None
 last_restart = 0
 restart_times = []
 watchdog_start_time = time.time()
@@ -93,6 +99,52 @@ def _hermes_env():
     env = os.environ.copy()
     env["HERMES_HOME"] = HERMES_HOME
     return env
+
+
+# ---- Single-instance guard ----
+
+def _read_watchdog_lock():
+    """Read PID from watchdog.lock. Returns (pid, start_time) or (None, None)."""
+    try:
+        with open(WATCHDOG_LOCK, "r") as f:
+            data = json.load(f)
+            return data.get("pid"), data.get("start_time")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None, None
+
+
+def _write_watchdog_lock():
+    """Write our PID and start time to watchdog.lock."""
+    try:
+        with open(WATCHDOG_LOCK, "w") as f:
+            json.dump({"pid": os.getpid(), "start_time": time.time()}, f)
+    except Exception as e:
+        log(f"Warning: could not write watchdog.lock: {e}")
+
+
+def _clear_watchdog_lock():
+    """Remove watchdog.lock on exit."""
+    try:
+        if os.path.exists(WATCHDOG_LOCK):
+            os.remove(WATCHDOG_LOCK)
+    except Exception:
+        pass
+
+
+def acquire_instance_lock():
+    """Ensure only one watchdog instance is running.
+    Returns True if we should proceed, False if another instance is alive."""
+    existing_pid, existing_start = _read_watchdog_lock()
+    if existing_pid is not None:
+        if is_pid_alive(existing_pid):
+            # Another watchdog is alive — exit silently
+            sys.exit(0)
+        else:
+            # Stale lock from a dead process — clean it up
+            log(f"Found stale watchdog.lock (PID {existing_pid} dead), clearing")
+            _clear_watchdog_lock()
+    _write_watchdog_lock()
+    return True
 
 
 # ---- PID-based health check (primary) ----
@@ -269,7 +321,7 @@ def can_restart():
 
 def do_restart(reason):
     """Kill (if needed) and restart the gateway."""
-    global last_restart, restart_times, down_since, tick_stale_since, log_stale_since
+    global last_restart, restart_times, down_since, tick_stale_since
     log(f"RESTARTING gateway: {reason}")
     if is_gateway_running():
         kill_gateway()
@@ -278,92 +330,74 @@ def do_restart(reason):
     restart_times.append(time.time())
     down_since = None
     tick_stale_since = None
-    log_stale_since = None
 
 
 def main():
-    global down_since, tick_stale_since, log_stale_since, last_restart, restart_times
+    global down_since, tick_stale_since, last_restart, restart_times
 
-    log(f"Watchdog v2.2 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
-        f"(tick heartbeat: {TICK_STALE_THRESHOLD}s, log backstop: {LOG_STALE_THRESHOLD}s)")
+    # Single-instance guard: exit if another watchdog is already alive
+    acquire_instance_lock()
 
-    while True:
-        try:
-            running = is_gateway_running()
-            # Grace period: skip heartbeat checks for STARTUP_GRACE after any restart
-            in_grace = (time.time() - last_restart) < STARTUP_GRACE if last_restart else \
-                       (time.time() - watchdog_start_time) < STARTUP_GRACE
+    log(f"Watchdog v2.4 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
+        f"(tick heartbeat: {TICK_STALE_THRESHOLD}s)")
 
-            # --- Check 1: Process alive ---
-            if not running:
-                tick_stale_since = None  # irrelevant if process is dead
-                log_stale_since = None
-                if down_since is None:
-                    down_since = time.time()
-                    log("Gateway process DOWN")
+    try:
+        while True:
+            try:
+                running = is_gateway_running()
+                # Grace period: skip heartbeat checks for STARTUP_GRACE after any restart
+                in_grace = (time.time() - last_restart) < STARTUP_GRACE if last_restart else \
+                           (time.time() - watchdog_start_time) < STARTUP_GRACE
+
+                # --- Check 1: Process alive ---
+                if not running:
+                    tick_stale_since = None  # irrelevant if process is dead
+                    if down_since is None:
+                        down_since = time.time()
+                        log("Gateway process DOWN")
+                    else:
+                        down_duration = time.time() - down_since
+                        if down_duration >= DOWN_THRESHOLD and can_restart():
+                            do_restart(f"process down {down_duration:.0f}s")
+                    time.sleep(CHECK_INTERVAL)
+                    continue
                 else:
-                    down_duration = time.time() - down_since
-                    if down_duration >= DOWN_THRESHOLD and can_restart():
-                        do_restart(f"process down {down_duration:.0f}s")
+                    # Process is alive
+                    if down_since is not None:
+                        log("Gateway process recovered")
+                    down_since = None
+
+                # --- Check 2: Cron tick lock heartbeat (primary zombie check) ---
+                # Skip during grace period (fresh restart or watchdog just started)
+                if not in_grace:
+                    tick_age = get_file_age(CRON_TICK_LOCK)
+                    if tick_age is not None and tick_age > TICK_STALE_THRESHOLD:
+                        if tick_stale_since is None:
+                            tick_stale_since = time.time()
+                            log(f"Gateway tick lock stale ({tick_age:.0f}s since last touch) - "
+                                f"event loop may be dead")
+                        else:
+                            stale_duration = time.time() - tick_stale_since
+                            if stale_duration >= 60 and can_restart():
+                                do_restart(f"tick lock stale for {tick_age:.0f}s "
+                                           f"(detected {stale_duration:.0f}s ago)")
+                                time.sleep(CHECK_INTERVAL)
+                                continue
+                    else:
+                        if tick_stale_since is not None:
+                            log("Gateway tick lock recovered - event loop alive")
+                        tick_stale_since = None
+
                 time.sleep(CHECK_INTERVAL)
-                continue
-            else:
-                # Process is alive
-                if down_since is not None:
-                    log("Gateway process recovered")
-                down_since = None
 
-            # --- Check 2: Cron tick lock heartbeat (primary zombie check) ---
-            # Skip during grace period (fresh restart or watchdog just started)
-            if not in_grace:
-                tick_age = get_file_age(CRON_TICK_LOCK)
-                if tick_age is not None and tick_age > TICK_STALE_THRESHOLD:
-                    if tick_stale_since is None:
-                        tick_stale_since = time.time()
-                        log(f"Gateway tick lock stale ({tick_age:.0f}s since last touch) - "
-                            f"event loop may be dead")
-                    else:
-                        stale_duration = time.time() - tick_stale_since
-                        if stale_duration >= 60 and can_restart():
-                            do_restart(f"tick lock stale for {tick_age:.0f}s "
-                                       f"(detected {stale_duration:.0f}s ago)")
-                            time.sleep(CHECK_INTERVAL)
-                            continue
-                else:
-                    if tick_stale_since is not None:
-                        log("Gateway tick lock recovered - event loop alive")
-                    tick_stale_since = None
-
-            # --- Check 3: Log freshness backstop (4h, catches pathological cases) ---
-            # Only fires if the tick heartbeat is ALSO stale — a quiet log with a live
-            # heartbeat just means nobody's talking to the gateway (normal idle).
-            if not in_grace and tick_stale_since is not None:
-                log_age = get_file_age(GATEWAY_LOG)
-                if log_age is not None and log_age > LOG_STALE_THRESHOLD:
-                    if log_stale_since is None:
-                        log_stale_since = time.time()
-                        log(f"Gateway log stale ({log_age:.0f}s since last write) AND "
-                            f"tick stale - backstop trigger")
-                    else:
-                        stale_duration = time.time() - log_stale_since
-                        if stale_duration >= 60 and can_restart():
-                            do_restart(f"log stale for {log_age:.0f}s AND tick stale "
-                                       f"(detected {stale_duration:.0f}s ago) [backstop]")
-                            time.sleep(CHECK_INTERVAL)
-                            continue
-                else:
-                    if log_stale_since is not None:
-                        log("Gateway log active again - recovered")
-                    log_stale_since = None
-
-            time.sleep(CHECK_INTERVAL)
-
-        except KeyboardInterrupt:
-            log("Watchdog stopped by user")
-            break
-        except Exception as e:
-            log(f"Unexpected error: {e}")
-            time.sleep(CHECK_INTERVAL)
+            except KeyboardInterrupt:
+                log("Watchdog stopped by user")
+                break
+            except Exception as e:
+                log(f"Unexpected error: {e}")
+                time.sleep(CHECK_INTERVAL)
+    finally:
+        _clear_watchdog_lock()
 
 
 if __name__ == "__main__":
