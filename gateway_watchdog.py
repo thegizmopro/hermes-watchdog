@@ -1,7 +1,14 @@
 """
-Hermes Gateway Watchdog for Windows (v2.4)
+Hermes Gateway Watchdog for Windows (v2.5)
 Runs persistently, monitors gateway, restarts if down or frozen.
 Designed to be started via Scheduled Task (AtStartup trigger).
+
+v2.5 changes (2026-07-01):
+  - CRITICAL: Added self-healing heartbeat to watchdog.lock (last_heartbeat updated every loop)
+  - CRITICAL: Added top-level exception safety — main loop catches all exceptions and continues
+  - CRITICAL: Added sleep/wake detection — large time gap between iterations triggers immediate re-check
+  - These fix the Modern Standby kill: StopOnIdleEnd=true + idle event = silent watchdog death
+  - Script changes complement the task XML fix (StopOnIdleEnd=false, dual BootTrigger+CalendarTrigger)
 
 v2.4 changes (2026-06-30):
   - Merged best of Holly v2.3 + Mini v2.3 into unified fleet version
@@ -113,13 +120,37 @@ def _read_watchdog_lock():
         return None, None
 
 
+def _read_watchdog_lock_full():
+    """Read all fields from watchdog.lock. Returns (pid, start_time, last_heartbeat) or (None, None, None)."""
+    try:
+        with open(WATCHDOG_LOCK, "r") as f:
+            data = json.load(f)
+            return data.get("pid"), data.get("start_time"), data.get("last_heartbeat")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None, None, None
+
+
 def _write_watchdog_lock():
     """Write our PID and start time to watchdog.lock."""
     try:
         with open(WATCHDOG_LOCK, "w") as f:
-            json.dump({"pid": os.getpid(), "start_time": time.time()}, f)
+            json.dump({"pid": os.getpid(), "start_time": time.time(),
+                       "last_heartbeat": time.time()}, f)
     except Exception as e:
         log(f"Warning: could not write watchdog.lock: {e}")
+
+
+def _touch_watchdog_lock():
+    """Update the heartbeat timestamp in watchdog.lock without changing PID."""
+    try:
+        with open(WATCHDOG_LOCK, "r") as f:
+            data = json.load(f)
+        data["last_heartbeat"] = time.time()
+        with open(WATCHDOG_LOCK, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        # Lock file might be gone or corrupted — rewrite it
+        _write_watchdog_lock()
 
 
 def _clear_watchdog_lock():
@@ -141,7 +172,14 @@ def acquire_instance_lock():
             sys.exit(0)
         else:
             # Stale lock from a dead process — clean it up
-            log(f"Found stale watchdog.lock (PID {existing_pid} dead), clearing")
+            # Check heartbeat to see how long it's been dead
+            _, _, last_hb = _read_watchdog_lock_full()
+            if last_hb:
+                dead_for = time.time() - last_hb
+                log(f"Found stale watchdog.lock (PID {existing_pid} dead, "
+                    f"heartbeat stopped {dead_for:.0f}s ago), clearing")
+            else:
+                log(f"Found stale watchdog.lock (PID {existing_pid} dead), clearing")
             _clear_watchdog_lock()
     _write_watchdog_lock()
     return True
@@ -338,12 +376,29 @@ def main():
     # Single-instance guard: exit if another watchdog is already alive
     acquire_instance_lock()
 
-    log(f"Watchdog v2.4 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
+    log(f"Watchdog v2.5 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
         f"(tick heartbeat: {TICK_STALE_THRESHOLD}s)")
 
     try:
         while True:
             try:
+                loop_start = time.time()
+
+                # --- Heartbeat: touch our own lock so we're trackable ---
+                _touch_watchdog_lock()
+
+                # --- Sleep/wake detection ---
+                # If more than 2x CHECK_INTERVAL passed since last loop iteration,
+                # the machine likely slept/woke. Log it and reset grace timers.
+                if hasattr(main, '_last_loop_time'):
+                    elapsed = loop_start - main._last_loop_time
+                    if elapsed > CHECK_INTERVAL * 3:
+                        log(f"Recovered from sleep/suspend ({elapsed:.0f}s gap) - "
+                            f"rechecking gateway immediately")
+                        # Reset the grace period to give gateway time to wake up too
+                        last_restart = loop_start
+                main._last_loop_time = loop_start
+
                 running = is_gateway_running()
                 # Grace period: skip heartbeat checks for STARTUP_GRACE after any restart
                 in_grace = (time.time() - last_restart) < STARTUP_GRACE if last_restart else \
@@ -394,7 +449,8 @@ def main():
                 log("Watchdog stopped by user")
                 break
             except Exception as e:
-                log(f"Unexpected error: {e}")
+                # CRITICAL: never die from an unexpected error — log and continue
+                log(f"Unexpected error in main loop: {type(e).__name__}: {e}")
                 time.sleep(CHECK_INTERVAL)
     finally:
         _clear_watchdog_lock()
