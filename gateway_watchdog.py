@@ -1,7 +1,19 @@
 """
-Hermes Gateway Watchdog for Windows (v2.5)
+Hermes Gateway Watchdog for Windows (v2.6)
 Runs persistently, monitors gateway, restarts if down or frozen.
 Designed to be started via Scheduled Task (AtStartup trigger).
+
+v2.6 changes (2026-07-31):
+  - NEW: Check 3 — platform adapter zombie detection
+    Reads gateway_state.json and checks if platforms.telegram.state is healthy.
+    If the adapter is in "retrying" state with an error_code AND hasn't updated
+    its timestamp recently, the gateway is a zombie (process alive, adapter dead).
+    This catches the case where the gateway logs "Fatal adapter error... Restarting"
+    but never actually exits — the process hangs as a SYSTEM-level zombie that
+    can't be killed from user sessions. The watchdog runs as SYSTEM (S4U task)
+    so it CAN kill the zombie PID.
+  - False-positive safe: only triggers when adapter state is bad AND stale.
+    An actively-retrying adapter has a fresh updated_at and is left alone.
 
 v2.5 changes (2026-07-01):
   - CRITICAL: Added self-healing heartbeat to watchdog.lock (last_heartbeat updated every loop)
@@ -34,10 +46,13 @@ v2.1 changes (2026-06-07):
   - start_gateway() uses `schtasks /Run` (single process chain, no duplicates)
   - Explicit HERMES_HOME env var in all subprocess calls
 
-Two-tier health check:
+Three-tier health check:
   1. PID file check — is the process from gateway.pid alive?
   2. Cron tick lock heartbeat — has cron/.tick.lock been touched recently?
      (Catches "zombie" state: process alive but event loop dead.)
+  3. Platform adapter health — is telegram state "connected" in gateway_state.json?
+     (Catches "wedged zombie": process alive, event loop alive, but adapter dead
+     after fatal network error. Gateway logs "restarting" but never exits.)
 
 Single-instance guard:
   Uses watchdog.lock to ensure only one watchdog process runs at a time.
@@ -63,9 +78,17 @@ RESTART_COOLDOWN = 60      # minimum seconds between restarts
 MAX_RESTARTS_PER_HOUR = 5  # circuit breaker
 STARTUP_GRACE = 120        # seconds after restart before heartbeat checks (handles startup + sleep/wake)
 
+# Platform adapter zombie detection (Check 3)
+# When the gateway hits a fatal Telegram error, it logs "restarting" but may not
+# actually exit. The adapter state in gateway_state.json will show "retrying" with
+# an error_code. We only treat it as a zombie if the state has been stale for this
+# long — an actively-retrying adapter updates its timestamp frequently.
+ADAPTER_STALE_THRESHOLD = 180  # 3 minutes — if no state update for this long while in error, it's wedged
+
 HERMES_HOME = r"C:\Users\kenzo\AppData\Local\hermes"
 HERMES_EXE = r"C:\Users\kenzo\AppData\Local\hermes\hermes-agent\venv\Scripts\hermes.exe"
 GATEWAY_PID_FILE = os.path.join(HERMES_HOME, "gateway.pid")
+GATEWAY_STATE_FILE = os.path.join(HERMES_HOME, "gateway_state.json")
 CRON_TICK_LOCK = os.path.join(HERMES_HOME, "cron", ".tick.lock")
 WATCHDOG_LOG = os.path.join(HERMES_HOME, "logs", "watchdog.log")
 WATCHDOG_LOCK = os.path.join(HERMES_HOME, "watchdog.lock")
@@ -80,6 +103,7 @@ GATEWAY_EXCLUDES = ["gateway_watchdog", "wmic"]
 
 down_since = None
 tick_stale_since = None
+adapter_zombie_since = None
 last_restart = 0
 restart_times = []
 watchdog_start_time = time.time()
@@ -260,6 +284,71 @@ def is_gateway_running():
     return len(pids) > 0
 
 
+# ---- Platform adapter health check (Check 3) ----
+
+def check_adapter_health():
+    """Check if the Telegram adapter in gateway_state.json is healthy.
+    
+    Returns (healthy: bool, reason: str).
+    
+    A gateway can be a "wedged zombie": process alive, cron ticker alive,
+    but the Telegram adapter died after a fatal network error and the
+    gateway never actually exited. It logs "restarting" but hangs.
+    
+    Detection: telegram.state != "connected" AND the state hasn't been
+    updated recently (stale). An actively-retrying adapter updates its
+    timestamp frequently — only a truly wedged one goes silent.
+    
+    False-positive safety:
+    - State "connected" → always healthy
+    - State "retrying" with fresh updated_at → healthy (it's trying)
+    - State "retrying" with stale updated_at → zombie
+    - Any error_code with stale updated_at → zombie
+    """
+    try:
+        with open(GATEWAY_STATE_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        # Can't read state file — skip this check, other checks handle it
+        return True, "state file unreadable"
+    
+    platforms = data.get("platforms", {})
+    telegram = platforms.get("telegram", {})
+    if not telegram:
+        return True, "no telegram platform configured"
+    
+    tg_state = telegram.get("state", "")
+    tg_error = telegram.get("error_code")
+    tg_updated = telegram.get("updated_at", "")
+    
+    # Healthy state — no need to check further
+    if tg_state == "connected" and not tg_error:
+        return True, "connected"
+    
+    # Adapter is not connected. Check if the state is stale.
+    # Parse ISO 8601 timestamp and check age.
+    if not tg_updated:
+        return True, "no updated_at (adapter may be initializing)"
+    
+    try:
+        from datetime import datetime as dt
+        # Handle timezone-aware ISO timestamps
+        ts = tg_updated.replace("Z", "+00:00")
+        updated_dt = dt.fromisoformat(ts)
+        now_dt = dt.now(updated_dt.tzinfo) if updated_dt.tzinfo else dt.now()
+        age = (now_dt - updated_dt).total_seconds()
+    except Exception:
+        # Can't parse timestamp — don't act on it
+        return True, "unreadable timestamp"
+    
+    if age < ADAPTER_STALE_THRESHOLD:
+        return True, f"adapter in {tg_state}, but fresh ({age:.0f}s ago)"
+    
+    # Adapter is in a bad state AND stale — this is a wedged zombie
+    return False, (f"adapter zombie: telegram state={tg_state} "
+                   f"error={tg_error} stale={age:.0f}s")
+
+
 def get_file_age(path):
     """Return age of a file in seconds, or None if file missing."""
     try:
@@ -359,7 +448,7 @@ def can_restart():
 
 def do_restart(reason):
     """Kill (if needed) and restart the gateway."""
-    global last_restart, restart_times, down_since, tick_stale_since
+    global last_restart, restart_times, down_since, tick_stale_since, adapter_zombie_since
     log(f"RESTARTING gateway: {reason}")
     if is_gateway_running():
         kill_gateway()
@@ -368,16 +457,17 @@ def do_restart(reason):
     restart_times.append(time.time())
     down_since = None
     tick_stale_since = None
+    adapter_zombie_since = None
 
 
 def main():
-    global down_since, tick_stale_since, last_restart, restart_times
+    global down_since, tick_stale_since, adapter_zombie_since, last_restart, restart_times
 
     # Single-instance guard: exit if another watchdog is already alive
     acquire_instance_lock()
 
-    log(f"Watchdog v2.5 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
-        f"(tick heartbeat: {TICK_STALE_THRESHOLD}s)")
+    log(f"Watchdog v2.6 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
+        f"(tick heartbeat: {TICK_STALE_THRESHOLD}s, adapter stale: {ADAPTER_STALE_THRESHOLD}s)")
 
     try:
         while True:
@@ -442,6 +532,26 @@ def main():
                         if tick_stale_since is not None:
                             log("Gateway tick lock recovered - event loop alive")
                         tick_stale_since = None
+
+                # --- Check 3: Platform adapter health (catches wedged zombies) ---
+                # Skip during grace period
+                if not in_grace:
+                    adapter_healthy, adapter_reason = check_adapter_health()
+                    if not adapter_healthy:
+                        if adapter_zombie_since is None:
+                            adapter_zombie_since = time.time()
+                            log(f"Gateway adapter unhealthy: {adapter_reason}")
+                        else:
+                            zombie_duration = time.time() - adapter_zombie_since
+                            if zombie_duration >= 60 and can_restart():
+                                do_restart(f"adapter zombie: {adapter_reason} "
+                                           f"(detected {zombie_duration:.0f}s ago)")
+                                time.sleep(CHECK_INTERVAL)
+                                continue
+                    else:
+                        if adapter_zombie_since is not None:
+                            log(f"Gateway adapter recovered: {adapter_reason}")
+                        adapter_zombie_since = None
 
                 time.sleep(CHECK_INTERVAL)
 

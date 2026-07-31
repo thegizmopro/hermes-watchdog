@@ -1,31 +1,47 @@
 # ===========================================================================
-#  Hermes Gateway Tray Icon  --  hermes-tray.ps1  (v2 -- PID-file based)
+#  Hermes Gateway Tray Icon  —  hermes-tray.ps1  (v3 — Mutex-guarded)
 #  Shows green/red/yellow circle based on gateway status.
-#  Left-click -> live log tail   Right-click -> context menu
+#  Left-click → live log tail   Right-click → context menu
+#
+#  v3 changes (2026-07-31):
+#    - Single-instance guard via named Mutex (Global\HermesTray)
+#      Fixes duplicate tray icons after reboot when both AtLogOn and AtStartup
+#      triggers fire before either instance can set a lock.
+#      The Mutex is held for the lifetime of the process; second instance exits.
 #
 #  v2 changes (2026-06-07):
 #    - Test-GatewayRunning: reads gateway.pid instead of looking for hermes.exe
 #    - Restart-Gateway: uses hermes gateway stop + schtasks /Run (no duplicates)
 # ===========================================================================
 
+# —— Single-instance guard (Mutex) —————————————————————————————————————————
+# Prevents duplicate tray icons when both AtLogOn and AtStartup triggers fire.
+$mutexName = "Global\HermesTray"
+$script:TrayMutex = [System.Threading.Mutex]::new($false, $mutexName)
+if (-not $script:TrayMutex.WaitOne(0, $false)) {
+    # Another tray instance holds the mutex — exit silently
+    $script:TrayMutex.Dispose()
+    exit
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# ---- paths ------------------------------------------------------------------------------------------------------------------------------------
+# —— paths ——————————————————————————————————————————————————————————————————
 $HermesExe     = "C:\Users\kenzo\AppData\Local\hermes\hermes-agent\venv\Scripts\hermes.exe"
 $GatewayLog    = "C:\Users\kenzo\AppData\Local\hermes\logs\gateway.log"
 $GatewayPidFile = "C:\Users\kenzo\AppData\Local\hermes\gateway.pid"
 $TelegramUrl   = "https://t.me/MiniHermesBot"
 $ScriptsDir    = "C:\Users\kenzo\AppData\Local\hermes\scripts"
 
-# ---- state --------------------------------------------------------------------------------------------------------------------------------------
+# —— state ———————————————————————————————————————————————————————————————————
 $script:LastStatus   = $null          # "UP" | "DOWN" | $null (first run)
 $script:UpSince      = $null          # datetime when gateway first seen UP
 $script:LogForm      = $null
 $script:LogTextBox   = $null
 $script:LogTailJob   = $null
 
-# ---- icon helpers ------------------------------------------------------------------------------------------------------------------------
+# —— icon helpers ————————————————————————————————————————————————————————————
 function New-CircleIcon {
     param(
         [ValidateSet("Green","Red","Yellow")]
@@ -56,7 +72,7 @@ $script:IconGreen  = New-CircleIcon -Color Green
 $script:IconRed    = New-CircleIcon -Color Red
 $script:IconYellow = New-CircleIcon -Color Yellow
 
-# ---- gateway detection (v2: PID-file based) ----------------------------------------------------------------
+# —— gateway detection (v2: PID-file based) ————————————————————————————————
 function Test-GatewayRunning {
     # Primary: read gateway.pid and check if that PID is alive
     if (Test-Path $GatewayPidFile) {
@@ -84,7 +100,7 @@ function Test-GatewayRunning {
     return $false
 }
 
-# ---- tooltip text --------------------------------------------------------------------------------------------------------------------
+# —— tooltip text ——————————————————————————————————————————————————————————
 function Get-StatusTooltip {
     param([string]$Status)
     if ($Status -eq "UP") {
@@ -99,7 +115,7 @@ function Get-StatusTooltip {
     return "Hermes: DOWN"
 }
 
-# ---- live log window ----------------------------------------------------------------------------------------------------------------
+# —— live log window ————————————————————————————————————————————————————————
 function Show-LiveLog {
     # If already open, bring to front
     if ($script:LogForm -and !$script:LogForm.IsDisposed) {
@@ -176,7 +192,7 @@ function Show-LiveLog {
     $script:LogForm.Show() | Out-Null
 }
 
-# ---- restart gateway (v2: clean stop + schtasks start) --------------------------------------------
+# —— restart gateway (v2: clean stop + schtasks start) ——————————————————————
 function Restart-Gateway {
     # Stop gateway cleanly via hermes CLI
     try {
@@ -197,7 +213,7 @@ function Restart-Gateway {
     Update-Status
 }
 
-# ---- status update --------------------------------------------------------------------------------------------------------------------
+# —— status update ——————————————————————————————————————————————————————————
 function Update-Status {
     $notifyIcon = $script:TrayIcon
     if (-not $notifyIcon) { return }
@@ -233,7 +249,7 @@ function Update-Status {
     $script:LastStatus = $newStatus
 }
 
-# ---- build tray icon & menu --------------------------------------------------------------------------------------------------
+# —— build tray icon & menu —————————————————————————————————————————————————
 $script:TrayIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:TrayIcon.Icon  = $script:IconYellow
 $script:TrayIcon.Text  = "Hermes: Checking..."
@@ -273,32 +289,37 @@ $itemExit.Add_Click({
     $script:IconGreen.Dispose()
     $script:IconRed.Dispose()
     $script:IconYellow.Dispose()
+    # Release mutex
+    if ($script:TrayMutex) {
+        $script:TrayMutex.ReleaseMutex()
+        $script:TrayMutex.Dispose()
+    }
     [System.Windows.Forms.Application]::Exit()
 })
 
 $contextMenu.Items.AddRange(@($itemLiveLog, $itemRestart, $itemTelegram, $itemSep, $itemExit))
 $script:TrayIcon.ContextMenuStrip = $contextMenu
 
-# Left-click -> open live log
+# Left-click → open live log
 $script:TrayIcon.Add_Click({
     if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
         Show-LiveLog
     }
 })
 
-# ---- polling timer --------------------------------------------------------------------------------------------------------------------
+# —— polling timer ——————————————————————————————————————————————————————————
 $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 30000   # 30 seconds
 $pollTimer.Add_Tick({ Update-Status })
 $pollTimer.Start()
 
-# ---- initial check --------------------------------------------------------------------------------------------------------------------
+# —— initial check ——————————————————————————————————————————————————————————
 Update-Status
 
-# ---- run message loop --------------------------------------------------------------------------------------------------------------
+# —— run message loop ———————————————————————————————————————————————————————
 [System.Windows.Forms.Application]::Run()
 
-# ---- cleanup on exit ------------------------------------------------------------------------------------------------------------------
+# —— cleanup on exit —————————————————————————————————————————————————————————
 $pollTimer.Stop()
 $pollTimer.Dispose()
 $contextMenu.Dispose()
@@ -306,3 +327,7 @@ $script:TrayIcon.Dispose()
 $script:IconGreen.Dispose()
 $script:IconRed.Dispose()
 $script:IconYellow.Dispose()
+if ($script:TrayMutex) {
+    $script:TrayMutex.ReleaseMutex()
+    $script:TrayMutex.Dispose()
+}
