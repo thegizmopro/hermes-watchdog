@@ -106,6 +106,7 @@ $trayTriggerStartup.Delay = "PT60S"
 $traySettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
+    -DontStopOnIdleEnd `
     -StartWhenAvailable `
     -ExecutionTimeLimit (New-TimeSpan) `
     -MultipleInstances IgnoreNew
