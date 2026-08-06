@@ -1,7 +1,15 @@
 """
-Hermes Gateway Watchdog for Windows (v2.6)
+Hermes Gateway Watchdog for Windows (v2.7)
 Runs persistently, monitors gateway, restarts if down or frozen.
 Designed to be started via Scheduled Task (AtStartup trigger).
+
+v2.7 changes (2026-08-05):
+  - CRITICAL: Replaced deprecated wmic with PowerShell Get-CimInstance
+    wmic is removed/disabled on Windows 11 and hangs after sleep/wake,
+    producing phantom timeouts (including negative timeout values from
+    clock jumps). Get-CimInstance is the modern equivalent and works
+    reliably on Win10/Win11. Affects _find_gateway_pids() used in
+    kill fallback and is_gateway_running() fallback.
 
 v2.6 changes (2026-07-31):
   - NEW: Check 3 — platform adapter zombie detection
@@ -97,9 +105,9 @@ GATEWAY_TASK = "Hermes_Gateway"
 # State files that can go stale and cause issues
 STATE_FILES = ["gateway.pid", "gateway.lock"]
 
-# For fallback WMIC scan only
+# For fallback process scan only (was WMIC-based, now CIM via PowerShell)
 GATEWAY_MARKERS = ["gateway run"]
-GATEWAY_EXCLUDES = ["gateway_watchdog", "wmic"]
+GATEWAY_EXCLUDES = ["gateway_watchdog", "wmic", "get-ciminstance"]
 
 down_since = None
 tick_stale_since = None
@@ -234,53 +242,55 @@ def is_pid_alive(pid):
         return False
 
 
-# ---- WMIC-based fallback (for kill operations) ----
+# ---- CIM-based fallback (for kill operations) ----
 
-def _find_gateway_pids_wmic():
+def _find_gateway_pids():
     """Return list of PIDs for processes that look like the gateway.
-    Used for force-kill operations, not for health checking."""
+    Uses PowerShell Get-CimInstance (modern replacement for deprecated wmic).
+    Filtering done in PowerShell to avoid CSV parsing issues with complex
+    command lines. Used for force-kill operations and fallback health checking."""
+    # Build PowerShell-safe filters from markers/excludes
+    include_pattern = "|".join(GATEWAY_MARKERS)
+    exclude_pattern = "|".join(GATEWAY_EXCLUDES)
+    ps_script = (
+        "Get-CimInstance Win32_Process -Filter "
+        "\"Name='python.exe' OR Name='pythonw.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -match '{include_pattern}' "
+        f"-and $_.CommandLine -notmatch '{exclude_pattern}' }} | "
+        "Select-Object -ExpandProperty ProcessId"
+    )
     try:
         result = subprocess.run(
-            ["wmic", "process", "where",
-             "(name='python.exe' or name='pythonw.exe')",
-             "get", "ProcessId,CommandLine"],
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
             capture_output=True, text=True, timeout=10,
-            creationflags=0x08000000
+            creationflags=0x08000000  # CREATE_NO_WINDOW
         )
     except Exception as e:
-        log(f"WMIC error: {e}")
+        log(f"Process scan error (Get-CimInstance): {e}")
         return []
 
     found = []
     for line in result.stdout.splitlines():
         line = line.strip()
-        if not line or "ProcessId" in line:
+        if not line:
             continue
-        parts = line.rsplit(None, 1)
-        if len(parts) != 2:
-            continue
-        cmdline, pid_str = parts
         try:
-            pid = int(pid_str)
+            found.append(int(line))
         except ValueError:
             continue
-        cmdline_lower = cmdline.lower()
-        if any(m in cmdline_lower for m in GATEWAY_MARKERS) and \
-           not any(x in cmdline_lower for x in GATEWAY_EXCLUDES):
-            found.append(pid)
     return found
 
 
 def is_gateway_running():
     """Check if gateway is alive using PID file (primary).
-    Falls back to WMIC scan if PID file is missing."""
+    Falls back to CIM process scan if PID file is missing."""
     # Primary: check PID file
     pid = get_gateway_pid_from_file()
     if pid is not None:
         return is_pid_alive(pid)
     
     # Fallback: scan for gateway processes (no PID file yet)
-    pids = _find_gateway_pids_wmic()
+    pids = _find_gateway_pids()
     return len(pids) > 0
 
 
@@ -380,7 +390,7 @@ def kill_gateway():
 
     # Step 2: Wait, then force-kill any surviving processes
     time.sleep(3)
-    pids = _find_gateway_pids_wmic()
+    pids = _find_gateway_pids()
     if pids:
         log(f"Stragglers alive after stop, force-killing: {pids}")
         for pid in pids:
@@ -466,7 +476,7 @@ def main():
     # Single-instance guard: exit if another watchdog is already alive
     acquire_instance_lock()
 
-    log(f"Watchdog v2.6 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
+    log(f"Watchdog v2.7 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
         f"(tick heartbeat: {TICK_STALE_THRESHOLD}s, adapter stale: {ADAPTER_STALE_THRESHOLD}s)")
 
     try:
