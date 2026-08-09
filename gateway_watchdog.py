@@ -1,7 +1,20 @@
 """
-Hermes Gateway Watchdog for Windows (v2.7)
+Hermes Gateway Watchdog for Windows (v2.8)
 Runs persistently, monitors gateway, restarts if down or frozen.
 Designed to be started via Scheduled Task (AtStartup trigger).
+
+v2.8 changes (2026-08-09):
+  - CRITICAL: Fix negative timeout bug during Modern Standby
+    Python's subprocess.run(timeout=N) uses time.monotonic() internally, which
+    can produce negative elapsed values when Windows enters/exits Modern Standby
+    (sleep/wake clock jumps). This caused subprocess calls to throw TimeoutExpired
+    with negative values like "-79.5s", making _find_gateway_pids() return empty,
+    making is_gateway_running() think the gateway was DOWN when it was fine.
+    5 false "down" detections → circuit breaker → blocked actual needed restarts.
+  - Fix: Replaced subprocess.run(timeout=) with Popen + wall-clock (time.time())
+    timeout enforcement. Also _find_gateway_pids() returns None on scan failure
+    (inconclusive) instead of [] (definitively empty), so callers don't treat
+    a failed scan as "gateway is down".
 
 v2.7 changes (2026-08-05):
   - CRITICAL: Replaced deprecated wmic with PowerShell Get-CimInstance
@@ -229,14 +242,59 @@ def get_gateway_pid_from_file():
         return None
 
 
+def _run_subprocess_safe(cmd, timeout=10, env=None):
+    """Run a subprocess with wall-clock timeout that survives sleep/wake.
+    
+    Python's subprocess.run(timeout=) uses time.monotonic() which can produce
+    negative elapsed values during Modern Standby sleep/wake transitions on
+    Windows. This causes premature TimeoutExpired exceptions with negative
+    timeout values like "-79.5s".
+    
+    Uses Popen + time.time() (wall clock) for timeout enforcement.
+    Returns CompletedProcess-like object or None on failure.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            env=env
+        )
+    except Exception as e:
+        log(f"subprocess spawn error ({' '.join(cmd[:2])}): {e}")
+        return None
+    
+    deadline = time.time() + timeout
+    while True:
+        ret = proc.poll()
+        if ret is not None:
+            stdout, stderr = proc.communicate()
+            result = type('R', (), {
+                'stdout': stdout or '', 'stderr': stderr or '', 'returncode': ret
+            })()
+            return result
+        if time.time() >= deadline:
+            proc.kill()
+            try:
+                proc.communicate(timeout=2)
+            except Exception:
+                pass
+            return None
+        time.sleep(0.5)
+
+
 def is_pid_alive(pid):
     """Check if a Windows process exists by PID."""
     try:
-        result = subprocess.run(
+        result = _run_subprocess_safe(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, timeout=5,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
+            timeout=5
         )
+        if result is None:
+            # Scan failed (likely sleep/wake) — don't assume dead
+            return True
         return str(pid) in result.stdout and "No tasks" not in result.stdout
     except Exception:
         return False
@@ -248,8 +306,10 @@ def _find_gateway_pids():
     """Return list of PIDs for processes that look like the gateway.
     Uses PowerShell Get-CimInstance (modern replacement for deprecated wmic).
     Filtering done in PowerShell to avoid CSV parsing issues with complex
-    command lines. Used for force-kill operations and fallback health checking."""
-    # Build PowerShell-safe filters from markers/excludes
+    command lines. Used for force-kill operations and fallback health checking.
+    
+    Returns None if the scan itself failed (timeout, exception) so callers
+    can distinguish "no gateway found" from "couldn't scan"."""
     include_pattern = "|".join(GATEWAY_MARKERS)
     exclude_pattern = "|".join(GATEWAY_EXCLUDES)
     ps_script = (
@@ -259,15 +319,13 @@ def _find_gateway_pids():
         f"-and $_.CommandLine -notmatch '{exclude_pattern}' }} | "
         "Select-Object -ExpandProperty ProcessId"
     )
-    try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True, text=True, timeout=10,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
-        )
-    except Exception as e:
-        log(f"Process scan error (Get-CimInstance): {e}")
-        return []
+    result = _run_subprocess_safe(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        timeout=10
+    )
+    if result is None:
+        log("Process scan failed (timeout or sleep/wake) — treating as inconclusive")
+        return None
 
     found = []
     for line in result.stdout.splitlines():
@@ -291,6 +349,9 @@ def is_gateway_running():
     
     # Fallback: scan for gateway processes (no PID file yet)
     pids = _find_gateway_pids()
+    if pids is None:
+        # Scan failed — don't know, assume running to avoid false restarts
+        return True
     return len(pids) > 0
 
 
@@ -373,25 +434,22 @@ def kill_gateway():
     This handles: process termination, PID file cleanup, scheduled task stop.
     Falls back to taskkill for any stragglers."""
     # Step 1: Official stop command (stops scheduled task + drains process + cleans state)
-    try:
-        result = subprocess.run(
-            [HERMES_EXE, "gateway", "stop"],
-            capture_output=True, text=True, timeout=30,
-            env=_hermes_env(),
-            creationflags=0x08000000
-        )
+    result = _run_subprocess_safe(
+        [HERMES_EXE, "gateway", "stop"],
+        timeout=30,
+        env=_hermes_env()
+    )
+    if result is not None:
         output = (result.stdout + result.stderr).strip()
         if output:
             log(f"hermes gateway stop: {output}")
-    except subprocess.TimeoutExpired:
-        log("hermes gateway stop timed out, using force kill")
-    except Exception as e:
-        log(f"hermes gateway stop error: {e}")
+    else:
+        log("hermes gateway stop timed out or failed, using force kill")
 
     # Step 2: Wait, then force-kill any surviving processes
     time.sleep(3)
     pids = _find_gateway_pids()
-    if pids:
+    if pids:  # None = inconclusive, [] = none found, [pids] = kill them
         log(f"Stragglers alive after stop, force-killing: {pids}")
         for pid in pids:
             try:
@@ -421,17 +479,19 @@ def start_gateway():
     Uses schtasks /Run to trigger Hermes_Gateway, which creates a single
     pythonw.exe -> python.exe process chain (no duplicates)."""
     try:
-        result = subprocess.run(
+        result = _run_subprocess_safe(
             ["schtasks.exe", "/Run", "/TN", GATEWAY_TASK],
-            capture_output=True, text=True, timeout=15,
-            env=_hermes_env(),
-            creationflags=0x08000000
+            timeout=15,
+            env=_hermes_env()
         )
-        output = (result.stdout + result.stderr).strip()
-        if output:
-            log(f"Started {GATEWAY_TASK} task: {output}")
+        if result is not None:
+            output = (result.stdout + result.stderr).strip()
+            if output:
+                log(f"Started {GATEWAY_TASK} task: {output}")
+            else:
+                log(f"Started {GATEWAY_TASK} task")
         else:
-            log(f"Started {GATEWAY_TASK} task")
+            log(f"Failed to start gateway: schtasks timed out or failed")
     except Exception as e:
         log(f"Failed to start gateway: {e}")
 
@@ -476,7 +536,7 @@ def main():
     # Single-instance guard: exit if another watchdog is already alive
     acquire_instance_lock()
 
-    log(f"Watchdog v2.7 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
+    log(f"Watchdog v2.8 started (PID {os.getpid()}) - checking every {CHECK_INTERVAL}s "
         f"(tick heartbeat: {TICK_STALE_THRESHOLD}s, adapter stale: {ADAPTER_STALE_THRESHOLD}s)")
 
     try:
