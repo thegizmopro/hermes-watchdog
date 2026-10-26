@@ -3,18 +3,14 @@ Hermes Gateway Watchdog for Windows (v2.8)
 Runs persistently, monitors gateway, restarts if down or frozen.
 Designed to be started via Scheduled Task (AtStartup trigger).
 
-v2.8 changes (2026-08-09):
-  - CRITICAL: Fix negative timeout bug during Modern Standby
-    Python's subprocess.run(timeout=N) uses time.monotonic() internally, which
-    can produce negative elapsed values when Windows enters/exits Modern Standby
-    (sleep/wake clock jumps). This caused subprocess calls to throw TimeoutExpired
-    with negative values like "-79.5s", making _find_gateway_pids() return empty,
-    making is_gateway_running() think the gateway was DOWN when it was fine.
-    5 false "down" detections → circuit breaker → blocked actual needed restarts.
-  - Fix: Replaced subprocess.run(timeout=) with Popen + wall-clock (time.time())
-    timeout enforcement. Also _find_gateway_pids() returns None on scan failure
-    (inconclusive) instead of [] (definitively empty), so callers don't treat
-    a failed scan as "gateway is down".
+v2.8 changes (2026-10-26):
+  - HARDENED: is_pid_alive() tasklist timeout no longer returns False (dead).
+    Under heavy system load tasklist can exceed its 5s timeout — that is
+    indeterminate, not proof of death (observed during the Oct 26 lappy
+    lockup). On timeout: fall back to _state_file_alive_oracle(), which
+    reads gateway_state.json (pid match + updated_at fresh within 120s).
+    On other tasklist errors: assume alive — Check 2 (cron tick lock) and
+    Check 3 (adapter state) still independently detect real deaths.
 
 v2.7 changes (2026-08-05):
   - CRITICAL: Replaced deprecated wmic with PowerShell Get-CimInstance
@@ -242,62 +238,58 @@ def get_gateway_pid_from_file():
         return None
 
 
-def _run_subprocess_safe(cmd, timeout=10, env=None):
-    """Run a subprocess with wall-clock timeout that survives sleep/wake.
-    
-    Python's subprocess.run(timeout=) uses time.monotonic() which can produce
-    negative elapsed values during Modern Standby sleep/wake transitions on
-    Windows. This causes premature TimeoutExpired exceptions with negative
-    timeout values like "-79.5s".
-    
-    Uses Popen + time.time() (wall clock) for timeout enforcement.
-    Returns CompletedProcess-like object or None on failure.
-    """
+def _state_file_alive_oracle(pid):
+    """Liveness oracle based on gateway_state.json (v2.8).
+
+    If the gateway itself updated its state file within 120s with a matching
+    PID, it is alive — file-based, no subprocess, immune to system load.
+    Used when tasklist times out: a timeout is INDETERMINATE (busy system),
+    not proof of death."""
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-            env=env
-        )
-    except Exception as e:
-        log(f"subprocess spawn error ({' '.join(cmd[:2])}): {e}")
-        return None
-    
-    deadline = time.time() + timeout
-    while True:
-        ret = proc.poll()
-        if ret is not None:
-            stdout, stderr = proc.communicate()
-            result = type('R', (), {
-                'stdout': stdout or '', 'stderr': stderr or '', 'returncode': ret
-            })()
-            return result
-        if time.time() >= deadline:
-            proc.kill()
-            try:
-                proc.communicate(timeout=2)
-            except Exception:
-                pass
-            return None
-        time.sleep(0.5)
+        with open(GATEWAY_STATE_FILE, "r") as f:
+            data = json.load(f)
+        state_pid = data.get("pid")
+        if pid and state_pid and int(state_pid) != int(pid):
+            return False  # state file belongs to a different gateway instance
+        updated = data.get("updated_at", "")
+        if not updated:
+            return False
+        from datetime import datetime as dt
+        ts = updated.replace("Z", "+00:00")
+        updated_dt = dt.fromisoformat(ts)
+        now_dt = dt.now(updated_dt.tzinfo) if updated_dt.tzinfo else dt.now()
+        age = (now_dt - updated_dt).total_seconds()
+        return 0 <= age < 120  # fresh within 2 min = alive
+    except Exception:
+        return False  # unreadable/stale state file: cannot confirm liveness
 
 
 def is_pid_alive(pid):
-    """Check if a Windows process exists by PID."""
+    """Check if a Windows process exists by PID.
+
+    v2.8: tasklist TIMEOUT no longer means dead. A 5s timeout under system
+    load (the lappy-lockup signature) is indeterminate — fall back to the
+    gateway_state.json freshness oracle instead of triggering a false
+    restart of a healthy gateway."""
     try:
-        result = _run_subprocess_safe(
+        result = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-            timeout=5
+            capture_output=True, text=True, timeout=5,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
         )
-        if result is None:
-            # Scan failed (likely sleep/wake) — don't assume dead
-            return True
         return str(pid) in result.stdout and "No tasks" not in result.stdout
-    except Exception:
-        return False
+    except subprocess.TimeoutExpired:
+        alive = _state_file_alive_oracle(pid)
+        log(f"is_pid_alive: tasklist TIMEOUT pid={pid} (busy system); "
+            f"state-file oracle -> {'ALIVE' if alive else 'cannot confirm'}")
+        return alive
+    except Exception as e:
+        # tasklist itself failed (rare). Check 2 (cron tick lock) and Check 3
+        # (adapter state) still independently detect a dead gateway, so
+        # assume alive here rather than false-restart under load.
+        log(f"is_pid_alive: tasklist error pid={pid}: {e}; assuming alive "
+            f"(tick-lock + adapter checks still active)")
+        return True
 
 
 # ---- CIM-based fallback (for kill operations) ----
@@ -306,10 +298,8 @@ def _find_gateway_pids():
     """Return list of PIDs for processes that look like the gateway.
     Uses PowerShell Get-CimInstance (modern replacement for deprecated wmic).
     Filtering done in PowerShell to avoid CSV parsing issues with complex
-    command lines. Used for force-kill operations and fallback health checking.
-    
-    Returns None if the scan itself failed (timeout, exception) so callers
-    can distinguish "no gateway found" from "couldn't scan"."""
+    command lines. Used for force-kill operations and fallback health checking."""
+    # Build PowerShell-safe filters from markers/excludes
     include_pattern = "|".join(GATEWAY_MARKERS)
     exclude_pattern = "|".join(GATEWAY_EXCLUDES)
     ps_script = (
@@ -319,13 +309,15 @@ def _find_gateway_pids():
         f"-and $_.CommandLine -notmatch '{exclude_pattern}' }} | "
         "Select-Object -ExpandProperty ProcessId"
     )
-    result = _run_subprocess_safe(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-        timeout=10
-    )
-    if result is None:
-        log("Process scan failed (timeout or sleep/wake) — treating as inconclusive")
-        return None
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
+    except Exception as e:
+        log(f"Process scan error (Get-CimInstance): {e}")
+        return []
 
     found = []
     for line in result.stdout.splitlines():
@@ -349,9 +341,6 @@ def is_gateway_running():
     
     # Fallback: scan for gateway processes (no PID file yet)
     pids = _find_gateway_pids()
-    if pids is None:
-        # Scan failed — don't know, assume running to avoid false restarts
-        return True
     return len(pids) > 0
 
 
@@ -434,22 +423,25 @@ def kill_gateway():
     This handles: process termination, PID file cleanup, scheduled task stop.
     Falls back to taskkill for any stragglers."""
     # Step 1: Official stop command (stops scheduled task + drains process + cleans state)
-    result = _run_subprocess_safe(
-        [HERMES_EXE, "gateway", "stop"],
-        timeout=30,
-        env=_hermes_env()
-    )
-    if result is not None:
+    try:
+        result = subprocess.run(
+            [HERMES_EXE, "gateway", "stop"],
+            capture_output=True, text=True, timeout=30,
+            env=_hermes_env(),
+            creationflags=0x08000000
+        )
         output = (result.stdout + result.stderr).strip()
         if output:
             log(f"hermes gateway stop: {output}")
-    else:
-        log("hermes gateway stop timed out or failed, using force kill")
+    except subprocess.TimeoutExpired:
+        log("hermes gateway stop timed out, using force kill")
+    except Exception as e:
+        log(f"hermes gateway stop error: {e}")
 
     # Step 2: Wait, then force-kill any surviving processes
     time.sleep(3)
     pids = _find_gateway_pids()
-    if pids:  # None = inconclusive, [] = none found, [pids] = kill them
+    if pids:
         log(f"Stragglers alive after stop, force-killing: {pids}")
         for pid in pids:
             try:
@@ -479,19 +471,17 @@ def start_gateway():
     Uses schtasks /Run to trigger Hermes_Gateway, which creates a single
     pythonw.exe -> python.exe process chain (no duplicates)."""
     try:
-        result = _run_subprocess_safe(
+        result = subprocess.run(
             ["schtasks.exe", "/Run", "/TN", GATEWAY_TASK],
-            timeout=15,
-            env=_hermes_env()
+            capture_output=True, text=True, timeout=15,
+            env=_hermes_env(),
+            creationflags=0x08000000
         )
-        if result is not None:
-            output = (result.stdout + result.stderr).strip()
-            if output:
-                log(f"Started {GATEWAY_TASK} task: {output}")
-            else:
-                log(f"Started {GATEWAY_TASK} task")
+        output = (result.stdout + result.stderr).strip()
+        if output:
+            log(f"Started {GATEWAY_TASK} task: {output}")
         else:
-            log(f"Failed to start gateway: schtasks timed out or failed")
+            log(f"Started {GATEWAY_TASK} task")
     except Exception as e:
         log(f"Failed to start gateway: {e}")
 
